@@ -23,15 +23,39 @@
 
 #include "messagebus.h"
 #include "menu.h"
+#include "tide.h"
 
 /* drivers */
 #include "drivers/rtca.h"
 #include "drivers/display.h"
+#include <time.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-struct Tide {
-    uint8_t hoursLeft;  /* hours left to next low tide */
-    uint8_t minutesLeft; /* minutes left to next low tide */
+
+#define DAYINMINUTES 1440
+#define TRUE 1
+#define FALSE 0
+
+struct Tide
+{
+    uint8_t hour;  /* tide start hour */
+    uint8_t min; /* tide start minute */
+    int8_t height; /* height of this tide */
+    uint8_t day; /* to account for day changes */
 };
+
+static uint16_t idxTide;
+
+/* time to the next low tide */
+static struct Tide thisTide;
+static struct Tide nextTide;
+
+/* calculations */
+static uint8_t bRising = 0;
+static int16_t i16currentHeight = 0; // (scale = value * 10 )
+static uint16_t i16timeToNextTide = 1;
+////////
 
 enum tide_display_state {
     TIDE_DISPLAY_STATE_GRAPH = 0,
@@ -43,6 +67,7 @@ enum tide_display_state {
 
 /* time to the next low tide */
 static struct Tide tide;
+
 
 static const uint16_t twentyFourHoursInMinutes = (uint32_t)1440;
 static const uint16_t fullTideTime = (uint16_t)754;
@@ -60,41 +85,6 @@ static const char *graphs[4] = {
     "]_[^]"
 };
 static uint8_t graphOffset;
-
-/* editing state */
-static struct Tide enteredTimeOfNextLow;
-
-/* MARK: Helper Functions */
-uint16_t timeInMinutes(struct Tide aTide)
-{
-    uint16_t result = (uint16_t)aTide.minutesLeft;
-    result += (uint16_t)aTide.hoursLeft * (uint16_t)60;
-    return result;
-}
-
-uint16_t timeNowInMinutes(void)
-{
-    struct Tide timeNow;
-
-    timeNow.hoursLeft = rtca_time.hour;
-    timeNow.minutesLeft = rtca_time.min;
-    if (rtca_time.sec > 30)
-        timeNow.minutesLeft++;
-    return timeInMinutes(timeNow);
-}
-
-struct Tide timeFromMinutes(uint16_t minutes)
-{
-    struct Tide newTide;
-
-    newTide.hoursLeft = minutes/60;
-
-    uint16_t hoursInMinutes = (uint16_t)newTide.hoursLeft*(uint32_t)60;
-    minutes -= hoursInMinutes;
-    newTide.minutesLeft = minutes;
-
-    return newTide;
-}
 
 /* MARK: Drawing */
 
@@ -124,172 +114,147 @@ void drawScreen(void)
     display_clear(1, 0);
     display_clear(2, 0);
 
-    uint16_t nowInMinutes = timeNowInMinutes();
-    uint16_t leftUntilLow = timeInMinutes(tide);
-    uint16_t leftUntilHigh = halfTideTime;
+    /* screen 0 */
+    /* line 1 = current height */
+    /* line 2 = time to end tide */
+    
+    uint8_t u8HoursTonNextTide = (uint8_t) i16timeToNextTide / 60;
+    uint8_t u8MinutesTonNextTide = (uint8_t) i16timeToNextTide % 60;
+    //uint8_t u8CurrentHeight = i16currentHeight * 10;
 
-    if (leftUntilLow > leftUntilHigh)
-        leftUntilHigh = leftUntilLow - leftUntilHigh;
-    else
-        leftUntilHigh = leftUntilLow + leftUntilHigh;
-
-    struct Tide lowTide = tide;
-    struct Tide highTide = timeFromMinutes(leftUntilHigh);
-
-    /* screen 0 //graph + time till next peak */
-    /* line1 time */
-    if (leftUntilHigh < leftUntilLow) {
-        /* show time till high */
-        _printf(0, LCD_SEG_L1_3_2, "%02u", highTide.hoursLeft);
-        _printf(0, LCD_SEG_L1_1_0, "%02u", highTide.minutesLeft);
-
-        display_symbol(0, LCD_SYMB_MAX, SEG_ON);
-
-    } else {
-        /* show time till low */
-        _printf(0, LCD_SEG_L1_3_2, "%02u", lowTide.hoursLeft);
-        _printf(0, LCD_SEG_L1_1_0, "%02u", lowTide.minutesLeft);
-
-        display_symbol(0, LCD_UNIT_L2_MI, SEG_ON);
+    /* screen0 line1 current height */
+    if (i16currentHeight > 0)
+    {
+        display_chars(0, LCD_SEG_L1_3_2, "  ", SEG_SET);
+        _printf(0, LCD_SEG_L1_1_0, "%02d", i16currentHeight);
     }
-    blinkCol(0, 1);
-    display_symbol(0, LCD_SEG_L2_COL1, SEG_ON);
+    else
+    {
+        display_chars(0, LCD_SEG_L1_3_2, " -", SEG_SET);
+        _printf(0, LCD_SEG_L1_1_0, "%02d", -i16currentHeight);
+    }
+    display_symbol(0, LCD_UNIT_L1_M, SEG_ON);
+    display_symbol(0, LCD_SEG_L1_DP0, SEG_ON);
 
-    /* line 2 graph */
-    display_chars(0, LCD_SEG_L2_4_0, graphs[graphOffset], SEG_SET);
+    /* screen0 line2 time */
+    _printf(0, LCD_SEG_L2_3_2, "%02u", u8HoursTonNextTide);
+    _printf(0, LCD_SEG_L2_1_0, "%02u", u8MinutesTonNextTide);
+    display_symbol(0, LCD_SEG_L2_COL0, SEG_ON);
+    display_symbol(0, LCD_ICON_STOPWATCH, SEG_ON);
 
-    /** screen 1 **/
-    /* line 1 time till low */
-    _printf(1, LCD_SEG_L1_3_2, "%02u", lowTide.hoursLeft);
-    _printf(1, LCD_SEG_L1_1_0, "%02u", lowTide.minutesLeft);
+    /* screen 1 */
+    /* line 1 = this tide height */
+    /* line 2 = this tide time */
 
-    display_symbol(1, LCD_UNIT_L2_MI, SEG_ON);
+    /* screen01 line1 this tide height */
+    if (thisTide.height > 0)
+    {
+        display_chars(1, LCD_SEG_L1_3_2, "  ", SEG_SET);
+        _printf(1, LCD_SEG_L1_1_0, "%02d", thisTide.height);
+    }
+    else
+    {
+        display_chars(1, LCD_SEG_L1_3_2, " -", SEG_SET);
+        _printf(1, LCD_SEG_L1_1_0, "%02d", -thisTide.height);
+    }
+    display_symbol(1, LCD_UNIT_L1_M, SEG_ON);
+    display_symbol(1, LCD_SEG_L1_DP0, SEG_ON);
 
-    /* line 2 calculate time of next high */
-    uint16_t lowTideTimeInMinutes = (nowInMinutes + leftUntilLow)
-                                                % twentyFourHoursInMinutes;
-    struct Tide lowTideTime = timeFromMinutes(lowTideTimeInMinutes);
+    /* screen1 line2 this tide time */
+    _printf(1, LCD_SEG_L2_3_2, "%02u", thisTide.hour);
+    _printf(1, LCD_SEG_L2_1_0, "%02u", thisTide.min);
+    display_symbol(1, LCD_SEG_L2_COL0, SEG_ON);
 
-    _printf(1, LCD_SEG_L2_3_2, "%02u", lowTideTime.hoursLeft);
-    _printf(1, LCD_SEG_L2_1_0, "%02u", lowTideTime.minutesLeft);
+    /* screen 2 */
+    /* line 1 = next tide height */
+    /* line 2 = next tide time */
 
-    blinkCol(1, 1);
-    blinkCol(1, 2);
+    /* screen2 line1 next tide height */
+    if (nextTide.height > 0)
+    {
+        display_chars(2, LCD_SEG_L1_3_2, "  ", SEG_SET);
+        _printf(2, LCD_SEG_L1_1_0, "%02d", nextTide.height);
+    }
+    else
+    {
+        display_chars(2, LCD_SEG_L1_3_2, " -", SEG_SET);
+        _printf(2, LCD_SEG_L1_1_0, "%02d", -nextTide.height);
+    }
+    display_symbol(2, LCD_UNIT_L1_M, SEG_ON);
+    display_symbol(2, LCD_SEG_L1_DP0, SEG_ON);
 
-
-    /** screen 2 **/
-    /* Line 1 time high */
-    _printf(2, LCD_SEG_L1_3_2, "%02u", highTide.hoursLeft);
-    _printf(2, LCD_SEG_L1_1_0, "%02u", highTide.minutesLeft);
-    display_symbol(2, LCD_SYMB_MAX, SEG_ON);
-
-    /* line 2 calculate time of next high */
-    uint16_t highTideTimeInMinutes = (nowInMinutes + leftUntilHigh)
-                                                % twentyFourHoursInMinutes;
-    struct Tide highTideTime = timeFromMinutes(highTideTimeInMinutes);
-
-    _printf(2, LCD_SEG_L2_3_2, "%02u", highTideTime.hoursLeft);
-    _printf(2, LCD_SEG_L2_1_0, "%02u", highTideTime.minutesLeft);
-
-    blinkCol(2, 1);
-    blinkCol(2, 2);
+    /* screen2 line2 this tide time */
+    _printf(2, LCD_SEG_L2_3_2, "%02u", nextTide.hour);
+    _printf(2, LCD_SEG_L2_1_0, "%02u", nextTide.min);
+    display_symbol(2, LCD_SEG_L2_COL0, SEG_ON);
+    
+    /* show rising symbol in all screns */
+    if (bRising)
+    {
+        display_symbol(0, LCD_SYMB_ARROW_UP, SEG_ON);
+        display_symbol(1, LCD_SYMB_ARROW_UP, SEG_ON);
+        display_symbol(2, LCD_SYMB_ARROW_UP, SEG_ON);
+    }
+    else
+    {
+        display_symbol(0, LCD_SYMB_ARROW_DOWN, SEG_ON);
+        display_symbol(1, LCD_SYMB_ARROW_DOWN, SEG_ON);
+        display_symbol(2, LCD_SYMB_ARROW_DOWN, SEG_ON);
+    }
 }
 
 /* MARK: System Bus Events */
 void minuteTick()
 {
-    uint32_t tideInMinutes =  timeInMinutes(tide);
-    graphOffset = (fullTideTime - tideInMinutes)/((uint16_t)186);
-    graphOffset = graphOffset % 4;
+    uint16_t u16timeNowInMinutes = (rtca_time.hour * 60) + rtca_time.min;
+    uint16_t u16timeThisTideInMinutes = (thisTide.hour * 60)  + thisTide.min;
+    uint16_t u16timeNextTideInMinutes = (nextTide.hour * 60)  + nextTide.min;
 
-    /* count down the timer */
-    if (tide.minutesLeft == 0) {
-        tide.minutesLeft = 60;
-        if (tide.hoursLeft == 0) {
-            /* TODO: change to full tide time */
-            tide = timeFromMinutes(fullTideTime+1);
-            return;
-        }
-        tide.hoursLeft--;
+    i16timeToNextTide = u16timeNextTideInMinutes - u16timeNowInMinutes;
+
+    // if the next tide is the next day, add 24*60 minutes to the next tide time
+    if (rtca_time.day != nextTide.day)
+    {
+        u16timeNextTideInMinutes += DAYINMINUTES;
     }
-    tide.minutesLeft--;
+
+    // check if changed tide and update
+    if (u16timeNextTideInMinutes <= u16timeNowInMinutes)
+    {
+        idxTide += 3;
+
+        thisTide.hour = nextTide.hour;
+        thisTide.min = nextTide.min;
+        thisTide.height = nextTide.height;
+        thisTide.day = nextTide.day;
+
+        // if the next tide is in the next day, jumps the day mark
+        if (tides[idxTide] > 80)
+        {
+            nextTide.day = tides[idxTide+1];
+
+            idxTide += 3;
+        }
+        nextTide.hour = tides[idxTide];
+        nextTide.min = tides[idxTide+1];
+        nextTide.height = tides[idxTide+2];
+    }
+
+    // calculate current height
+    float fCoefficient = (float) (nextTide.height - thisTide.height) / (u16timeNextTideInMinutes - u16timeThisTideInMinutes);
+    i16currentHeight = (int16_t) (fCoefficient * (u16timeNowInMinutes - u16timeThisTideInMinutes) + (float) thisTide.height);
+    // set flag of rising or not
+    if ((nextTide.height - thisTide.height) >= 0)
+    {
+        bRising = TRUE;
+    }
+    else
+    {
+        bRising = FALSE;
+    }
 
     /* draw screens */
     drawScreen();
-}
-
-/* MARK: - Time Setup */
-void editHHSelect()
-{
-    display_chars(0, LCD_SEG_L1_3_2, NULL, BLINK_ON);
-}
-
-void editHHDeselect(void)
-{
-    display_chars(0, LCD_SEG_L1_3_2, NULL, BLINK_OFF);
-}
-
-void editHHSet(int8_t step)
-{
-    helpers_loop(&(enteredTimeOfNextLow.hoursLeft), 0, 23, step);
-    _printf(0, LCD_SEG_L1_3_2, "%02u", enteredTimeOfNextLow.hoursLeft);
-}
-
-void editMMSelect(void)
-{
-    display_chars(0, LCD_SEG_L1_1_0, NULL, BLINK_ON);
-}
-
-void editMMDeselect(void)
-{
-    display_chars(0, LCD_SEG_L1_1_0, NULL, BLINK_OFF);
-}
-
-void editMMSet(int8_t step)
-{
-    helpers_loop(&(enteredTimeOfNextLow.minutesLeft), 0, 59, step);
-    _printf(0, LCD_SEG_L1_1_0, "%02u", enteredTimeOfNextLow.minutesLeft);
-}
-
-static struct menu_editmode_item editModeItems[] = {
-    {&editHHSelect, &editHHDeselect, &editHHSet},
-    {&editMMSelect, &editMMDeselect, &editMMSet},
-    { NULL }
-};
-
-void endEditing(void)
-{
-    /* calculate minutes left for next low */
-    uint16_t nextLowMinutes = timeInMinutes(enteredTimeOfNextLow);
-    uint16_t nowInMinutes = timeNowInMinutes();
-    uint16_t diff = nextLowMinutes - nowInMinutes;
-    if (diff < 0) {
-        /* the next low is tomorrow! */
-        diff = (twentyFourHoursInMinutes - nowInMinutes) + nextLowMinutes;
-    }
-
-    tide = timeFromMinutes(diff);
-    editModeActivated = 0;
-    display_clear(0, 0);
-    drawScreen();
-}
-
-/* MARK:  - Buttons */
-void longStarButton(void)
-{
-    /* clear screen */
-    display_clear(0, 0);
-    lcd_screen_activate(0);
-
-    uint16_t nowInMinutes = timeNowInMinutes();
-    uint16_t leftUntilLow = timeInMinutes(tide);
-    enteredTimeOfNextLow = timeFromMinutes((nowInMinutes + leftUntilLow) % twentyFourHoursInMinutes);
-
-    editModeActivated = 1;
-    _printf(0, LCD_SEG_L1_3_2, "%02u", enteredTimeOfNextLow.hoursLeft);
-    _printf(0, LCD_SEG_L1_1_0, "%02u", enteredTimeOfNextLow.minutesLeft);
-    blinkCol(0, 1);
-    menu_editmode_start(&endEditing, NULL, editModeItems);
 }
 
 void buttonUp(void)
@@ -337,11 +302,78 @@ void mod_tide_init(void)
                    &buttonUp,
                    &buttonDown,
                    NULL,
-                   &longStarButton,
+                   NULL,
                    NULL,
                    NULL,
                    &activate,
                    &deactivate);
-    tide = timeFromMinutes(90); /* fullTideTime); */
-    minuteTick(); /* initla display setup */
+
+    // find initial tide:
+    uint16_t i = 0;
+    uint16_t szTides = sizeof(tides) / sizeof(tides[0]);
+    uint8_t bFoundTide = 0;
+    uint8_t u8day = 0;
+    while (bFoundTide == 0)
+    {
+        // found a day mark
+        if (tides[i] > 80)
+        {
+            // if the day mark is equal to current day
+            if ((tides[i] - 80) == rtca_time.mon && tides[i+1] == rtca_time.day)
+            {
+                u8day = rtca_time.day;
+                // find thistide/nexttide to initialize
+                i += 3;
+                // initialize with first tide
+                idxTide = i;
+                thisTide.hour = tides[i];
+                thisTide.min = tides[i+1];
+                thisTide.height = tides[i+2];
+                thisTide.day = u8day;
+
+                // we can assume the next is in the same day, since theres always 2 tides in a day
+                nextTide.hour = tides[i+3];
+                nextTide.min = tides[i+4];
+                nextTide.height = tides[i+5];
+                nextTide.day = u8day;
+
+                uint16_t timeNowInMinutes = (rtca_time.hour * 60) + rtca_time.min;
+                uint16_t timeTideInMinutes = 0;
+                while (i < szTides)
+                {
+                    if (tides[i] < 80)
+                    {
+                        timeTideInMinutes = (tides[i] * 60)  + tides[i+1] + (u8day - rtca_time.day) * DAYINMINUTES;
+                        if (timeTideInMinutes <= timeNowInMinutes)
+                        {
+                            // the tide can be in this state
+                            thisTide.hour = tides[i];
+                            thisTide.min = tides[i+1];
+                            thisTide.height = tides[i+2];
+                            thisTide.day = u8day;
+                            idxTide = i;
+                        }
+                        else
+                        {
+                            // we passed, so this is the next tide
+                            // must account if it is the next day (the watch initilizes close to midnight)
+                            nextTide.hour = tides[i];
+                            nextTide.min = tides[i+1];
+                            nextTide.height = tides[i+2];
+                            nextTide.day = u8day;
+                            bFoundTide = 1;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        u8day = tides[i+1];
+                    }
+                    i += 3;
+                }
+                break;
+            }
+        }
+        i += 3;
+    }
 }
