@@ -57,34 +57,8 @@ static int16_t i16currentHeight = 0; // (scale = value * 10 )
 static uint16_t i16timeToNextTide = 1;
 ////////
 
-enum tide_display_state {
-    TIDE_DISPLAY_STATE_GRAPH = 0,
-    TIDE_DISPLAY_STATE_TOLOWCOUNTER,
-    TIDE_DISPLAY_STATE_TOHIGHCOUNTER,
-    /* editing mode */
-    TIDE_DISPLAY_STATE_EDITING,
-};
-
-/* time to the next low tide */
-static struct Tide tide;
-
-
-static const uint16_t twentyFourHoursInMinutes = (uint32_t)1440;
-static const uint16_t fullTideTime = (uint16_t)754;
-static const uint16_t halfTideTime = (uint16_t)372; /* .5; */
-
-/* state of the display */
-static uint8_t moduleActivated;
-static uint8_t editModeActivated;
-static enum tide_display_state activeDisplay = TIDE_DISPLAY_STATE_GRAPH;
-
-static const char *graphs[4] = {
-    "_[^]_",
-    "[^]_[",
-    "^]_[^",
-    "]_[^]"
-};
-static uint8_t graphOffset;
+uint8_t moduleActivated = 0;
+uint8_t activeDisplay = 0;
 
 /* MARK: Drawing */
 
@@ -107,7 +81,7 @@ void blinkCol(uint8_t screen, uint8_t line)
 void drawScreen(void)
 {
     /* do nothing if not visible */
-    if (!moduleActivated || editModeActivated)
+    if (!moduleActivated)
         return;
 
     display_clear(0, 0);
@@ -117,11 +91,10 @@ void drawScreen(void)
     /* screen 0 */
     /* line 1 = current height */
     /* line 2 = time to end tide */
-    
+
     uint8_t u8HoursTonNextTide = (uint8_t) i16timeToNextTide / 60;
     uint8_t u8MinutesTonNextTide = (uint8_t) i16timeToNextTide % 60;
     //uint8_t u8CurrentHeight = i16currentHeight * 10;
-
     /* screen0 line1 current height */
     if (i16currentHeight > 0)
     {
@@ -281,7 +254,7 @@ void activate(void)
     /* create three empty screens */
     lcd_screens_create(3);
 
-    activeDisplay = TIDE_DISPLAY_STATE_GRAPH;
+    activeDisplay = 0;
     lcd_screen_activate(activeDisplay);
     drawScreen();
 }
